@@ -14,10 +14,33 @@
 #include <libnvpair.h>
 #include "spa.h"
 #include "dmu.h"
-//#include <sys/fs/zfs.h>
 #include "dnode.h"
 #include "dmu_objset.h"
+#include "dsl_dir.h"
+#include "zap_impl.h"
+#include "zap_leaf.h"
 #include <lz4.h>
+
+
+enum zio_compress {
+  ZIO_COMPRESS_INHERIT = 0,
+  ZIO_COMPRESS_ON,
+  ZIO_COMPRESS_OFF,
+  ZIO_COMPRESS_LZJB,
+  ZIO_COMPRESS_EMPTY,
+  ZIO_COMPRESS_GZIP_1,
+  ZIO_COMPRESS_GZIP_2,
+  ZIO_COMPRESS_GZIP_3,
+  ZIO_COMPRESS_GZIP_4,
+  ZIO_COMPRESS_GZIP_5,
+  ZIO_COMPRESS_GZIP_6,
+  ZIO_COMPRESS_GZIP_7,
+  ZIO_COMPRESS_GZIP_8,
+  ZIO_COMPRESS_GZIP_9,
+  ZIO_COMPRESS_ZLE,
+  ZIO_COMPRESS_LZ4,
+  ZIO_COMPRESS_FUNCTIONS
+};
 
 /*
  * NB: lzc_dataset_type should be updated whenever a new objset type is added,
@@ -56,6 +79,10 @@ void print_blkptr(const blkptr_t *p) {
   } else {
     std::cout << "blkptr: type " << t << " ";
   }
+  if (DMU_OT_NONE == t) {
+    std::cout << std::endl;
+    return;
+  }
   std::cout << (BP_GET_BYTEORDER(p) ? "LE" : "BE") << " ";
   std::cout << std::endl;
 
@@ -72,9 +99,73 @@ void print_blkptr(const blkptr_t *p) {
   }
 }
 
+// output must be at least LSIZE
+std::vector<uint8_t> read_block(const blkptr_t *p, const void *dev_base_ptr) {
+  auto vdev1 = DVA_GET_VDEV(&p->blk_dva[0]);
+  uint64_t off1 = DVA_GET_OFFSET(&p->blk_dva[0]);
+  auto gang1 = DVA_GET_GANG(&p->blk_dva[0]);
+  int asize = DVA_GET_ASIZE(&p->blk_dva[0]);
+  int lsize = BP_GET_LSIZE(p);
+  assert(vdev1 == 0);
+
+  std::vector<uint8_t> output(lsize, 0);
+  auto *blk = (const char *)dev_base_ptr + off1;
+  // assert lz4 compression
+  if (BP_GET_COMPRESS(p) == ZIO_COMPRESS_OFF || BP_GET_COMPRESS(p) == ZIO_COMPRESS_INHERIT) {
+    memcpy(output.data(), blk, lsize);
+  } else if (BP_GET_COMPRESS(p) == ZIO_COMPRESS_LZ4) {
+    auto input_size = __builtin_bswap32 (*(uint32_t*)blk);
+    const int decompressed_size = LZ4_decompress_safe(
+        (const char*)blk+sizeof(int32_t),
+        (char*)output.data(), input_size, lsize
+    );
+    assert(decompressed_size == lsize);
+  } else {
+    std::cerr << "unknown blkptr compression type " << BP_GET_COMPRESS(p) << std::endl;
+    assert(0);
+  }
+  return std::move(output);
+}
+#define ZFS_SEC_SIZE 512UL
+
+std::vector<uint8_t> read_obj(const objset_phys_t* objset, uint64_t id, const void *dev_base_ptr, int leaf_id) {
+  int level = objset->os_meta_dnode.dn_nlevels;
+  assert(objset->os_type == DMU_OST_META);
+  assert(objset->os_meta_dnode.dn_type == DMU_OT_DNODE);
+  auto data = read_block(&objset->os_meta_dnode.dn_blkptr[0], dev_base_ptr);
+  blkptr_t *blkptrs = (blkptr_t*)data.data();
+
+  // max indirection 6
+  std::vector<uint64_t> offsets;
+
+  size_t radix = (1UL << objset->os_meta_dnode.dn_indblkshift) / sizeof(blkptr_t);
+  size_t datablk_size = objset->os_meta_dnode.dn_datablkszsec * ZFS_SEC_SIZE;
+
+  while (level > 0) {
+    int curid = id % radix;
+    id = id / radix;
+    level--;
+    offsets.insert(offsets.begin(), curid);
+  }
+  dnode_phys_t *dnodeptrs;
+  data = read_block(&blkptrs[offsets[0]], dev_base_ptr);
+  dnodeptrs = (dnode_phys_t*)data.data();
+  for (int i = 1; i < offsets.size(); i++) {
+    auto dnode = &dnodeptrs[offsets[i]];
+//    assert(dnode->dn_nblkptr == 1);
+    int j = 0;
+    if (i == offsets.size() - 1) {
+      j = leaf_id;
+    }
+    data = read_block(&dnode->dn_blkptr[j], dev_base_ptr);
+    dnodeptrs = (dnode_phys_t*)data.data();
+  }
+  return std::move(data);
+}
+
 using namespace std;
 int main() {
-  const char *vdev_path = "x/testfile";
+  const char *vdev_path = "test3";
   int fd = open(vdev_path, O_RDONLY);
   if (fd < 0) {
     cerr << "failed to open file " << vdev_path << ", err: " << strerror(errno) << endl;
@@ -120,10 +211,10 @@ int main() {
     auto ub = (uberblock*)(vdev_ptr + block_size*1 + i * 1024);
     if (ub->ub_magic != 0) {
 //      assert(be_magic == ub->ub_magic);
-      cout << "ub magic: " << std::hex << std::setfill('0') << std::setw(8) << i << ", " << ub->ub_magic << endl;
+//      cout << "ub magic: " << std::hex << std::setfill('0') << std::setw(8) << i << ", " << ub->ub_magic << endl;
 
       txgs.emplace_back(i, ub->ub_txg);
-      cout << "ub: " << ub->ub_txg << endl;
+//      cout << "ub: " << ub->ub_txg << endl;
     }
   }
   if (txgs.empty()) {
@@ -142,39 +233,62 @@ int main() {
   cout << "ub_version: " << dec << main_ub->ub_version << endl;
   auto rootbp = &main_ub->ub_rootbp;
 
+  /** get root dnode array from root bp */
   // assert little endian
   assert(BP_GET_BYTEORDER(rootbp) == 1);
-
-  auto vdev1 = DVA_GET_VDEV(&rootbp->blk_dva[0]);
-  uint64_t off1 = DVA_GET_OFFSET(&rootbp->blk_dva[0]);
-  auto gang1 = DVA_GET_GANG(&rootbp->blk_dva[0]);
-  int asize = DVA_GET_ASIZE(&rootbp->blk_dva[0]);
-  int lsize = BP_GET_LSIZE(rootbp);
   cout << "rootbp: " << endl;
   print_blkptr(rootbp);
 
   auto rootbp_type = BP_GET_TYPE(rootbp);
-  cout << "rootbp prop: " << rootbp->blk_prop << endl;
   cout << "rootbp type 0x" << rootbp_type << endl;
 
-  // assert lz4 compression
-  assert(BP_GET_COMPRESS(rootbp) == 0xf);
-
   uint64_t data_off = 0x400000;
-  auto *metadnode_compressed = (objset_phys_t*)(vdev_ptr + data_off + off1);
-  auto *metadnode = (objset_phys_t*) new char[lsize];
-  auto input_size = __builtin_bswap32 (*(uint32_t*)metadnode_compressed);
-  const int decompressed_size = LZ4_decompress_safe(
-      (const char*)metadnode_compressed+sizeof(int32_t),
-      (char*)metadnode, input_size, lsize
-  );
-  cout << "dec size " << decompressed_size << endl;
+  auto dev_base_ptr = vdev_ptr + data_off;
 
-  cout << "os type " << metadnode->os_type << endl;
-  cout << "dnnode " << (int)metadnode->os_meta_dnode.dn_type << endl;
+  auto output = read_block(rootbp, dev_base_ptr);
+  auto metadnode = (objset_phys_t*)output.data();
 
-  for (int i = 0; i < metadnode->os_meta_dnode.dn_nblkptr; i++) {
-    print_blkptr(&metadnode->os_meta_dnode.dn_blkptr[i]);
+  assert(metadnode->os_type == DMU_OST_META);
+  assert(metadnode->os_meta_dnode.dn_type == DMU_OT_DNODE);
+
+  print_blkptr(&metadnode->os_meta_dnode.dn_blkptr[0]);
+  std::cout << "root dnodes level " << (int)metadnode->os_meta_dnode.dn_nlevels << endl;
+  auto data = read_block(&metadnode->os_meta_dnode.dn_blkptr[0], dev_base_ptr);
+  cout << "max blkid " << metadnode->os_meta_dnode.dn_maxblkid << endl;
+
+  auto obj1_data = read_obj(metadnode, 1, dev_base_ptr, 0);
+
+  auto zap = (zap_phys_t*)obj1_data.data();
+  assert(zap->zap_block_type == ZBT_HEADER);
+  auto *zap_leaves = (uint64_t*)((char*)zap + obj1_data.size() / 2);
+  uint64_t zap_leaf0_id = zap_leaves[0];
+
+  auto zap_leaf_data = read_obj(metadnode, 1, dev_base_ptr, 1);
+  zap_leaf_phys_t *leaf = (zap_leaf_phys_t*)zap_leaf_data.data();
+  cout << "leaf magic " << leaf->l_hdr.lh_magic << endl;
+  auto leaf_chunks_data = (char*)leaf + 7216;
+  auto *chunks = (zap_leaf_chunk_t*) leaf_chunks_data;
+  for (int i = 0; i < leaf->l_hdr.lh_nentries; i++) {
+    assert(chunks[i].l_entry.le_type == 252);
   }
+
+//  auto *zap_leaf0 = (zap_leaf_phys_t*)(dev_base_ptr + block_size * zap_leaf0_id);
+//  std::cout << "leaf magic: " << hex << zap_leaf0->l_hdr.lh_magic << std::endl;
+
+
+//  auto dnode1_data = read_block(&root_dnode_blkptrs[0], dev_base_ptr);
+//  auto dnode1 = (dnode_phys_t*)dnode1_data.data();
+////  std::cout << "dnode1 blkptr " << endl;
+////  print_blkptr(&dnode1->dn_blkptr[0]);
+//  cout << "dnode1 type " << (int)dnode1->dn_type << endl;
+//  assert(dnode1->dn_type == DMU_OT_DSL_DIR);
+//
+//  cout << "bonus len 0x" << hex << dnode1->dn_bonuslen << endl;
+//  auto dsldir = (dsl_dir_phys_t*)dnode1->dn_bonus;
+//  cout << "active dataset objnum 0x" << hex << dsldir->dd_head_dataset_obj << endl;
+//  cout << "parent obj 0x" << hex << dsldir->dd_parent_obj << endl;
+//  cout << "proj zapobj num 0x" << hex << dsldir->dd_props_zapobj << endl;
+
+
 
 }
